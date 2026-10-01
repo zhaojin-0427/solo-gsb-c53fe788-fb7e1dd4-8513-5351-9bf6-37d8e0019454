@@ -257,12 +257,158 @@ def test_aggregate_counterfactual_group_deletion(client):
     r = client.post("/query", json=req)
     assert r.status_code == 200, r.text
     cf = r.json()["counterfactual"]
-    assert cf["target_provenance"]["dnf"] == "(s1) ∨ (s2)"
-    # Group survives on either member, so both rows must be deleted.
-    assert cf["minimal_deletion_sets"] == [["orders[1]", "orders[2]"]]
-    scenario = cf["scenarios"][0]
-    assert scenario["target_present"] is False
-    assert scenario["result"]["rows"] == [{"cid": 20, "total": 9}]
+    # sum=12 needs both members: one conjunctive witness, two singleton
+    # minimal deletion sets — deleting either row changes the total.
+    assert cf["target_provenance"]["dnf"] == "(s1 ∧ s2)"
+    assert cf["minimal_deletion_sets"] == [["orders[1]"], ["orders[2]"]]
+    for scenario in cf["scenarios"]:
+        assert scenario["target_present"] is False
+        assert scenario["result"]["row_count"] == 2
+    by_delete = {tuple(sc["delete"]): sc for sc in cf["scenarios"]}
+    assert by_delete[("orders[1]",)]["result"]["rows"] == [
+        {"cid": 10, "total": 7},
+        {"cid": 20, "total": 9},
+    ]
+    assert by_delete[("orders[2]",)]["result"]["rows"] == [
+        {"cid": 10, "total": 5},
+        {"cid": 20, "total": 9},
+    ]
+
+
+def test_aggregate_count_sum_counterfactual(client):
+    """The 50/30 case: count=2 and sum=80 must be one conjunctive witness."""
+    req = {
+        "idempotency_key": "key-agg-50-30",
+        "tables": [
+            {
+                "table": "orders",
+                "primary_key": ["oid"],
+                "columns": ["oid", "cid", "amount"],
+                "rows": [
+                    {"oid": 1, "cid": 10, "amount": 50},
+                    {"oid": 2, "cid": 10, "amount": 30},
+                    {"oid": 3, "cid": 20, "amount": 10},
+                ],
+            }
+        ],
+        "plan": {
+            "type": "aggregate",
+            "input": {"type": "scan", "table": "orders"},
+            "group_by": ["cid"],
+            "aggregates": [
+                {"fn": "count", "column": "*", "as": "n"},
+                {"fn": "sum", "column": "amount", "as": "total"},
+            ],
+        },
+        "explain": {"row": {"cid": 10, "n": 2, "total": 80}},
+    }
+    r = client.post("/query", json=req)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["result"]["row_count"] == 2
+    target = next(x for x in body["result"]["rows"] if x["row"]["cid"] == 10)
+    assert target["witness_count"] == 1
+    assert target["provenance"]["dnf"] == "(s1 ∧ s2)"
+    assert target["minimal_witnesses"][0]["labels"] == ["orders[1]", "orders[2]"]
+    # The other group keeps its own single-row witness.
+    other = next(x for x in body["result"]["rows"] if x["row"]["cid"] == 20)
+    assert other["provenance"]["dnf"] == "(s3)"
+
+    cf = body["counterfactual"]
+    assert cf["minimal_deletion_sets"] == [["orders[1]"], ["orders[2]"]]
+    by_delete = {tuple(sc["delete"]): sc for sc in cf["scenarios"]}
+    for sc in cf["scenarios"]:
+        assert sc["target_present"] is False
+    # Recomputation agrees: removing either row changes count and sum.
+    assert by_delete[("orders[1]",)]["result"]["rows"] == [
+        {"cid": 10, "n": 1, "total": 30},
+        {"cid": 20, "n": 1, "total": 10},
+    ]
+    assert by_delete[("orders[2]",)]["result"]["rows"] == [
+        {"cid": 10, "n": 1, "total": 50},
+        {"cid": 20, "n": 1, "total": 10},
+    ]
+
+
+def test_aggregate_sum_equal_value_combos(client):
+    """Equal-valued rows keep distinct minimal sum combinations."""
+    req = {
+        "idempotency_key": "key-agg-equal-combos",
+        "tables": [
+            {
+                "table": "orders",
+                "primary_key": ["oid"],
+                "columns": ["oid", "amount"],
+                "rows": [
+                    {"oid": 1, "amount": 30},
+                    {"oid": 2, "amount": 30},
+                    {"oid": 3, "amount": 60},
+                    {"oid": 4, "amount": -60},
+                ],
+            }
+        ],
+        "plan": {
+            "type": "aggregate",
+            "input": {"type": "scan", "table": "orders"},
+            "aggregates": [{"fn": "sum", "column": "amount", "as": "total"}],
+        },
+        "explain": {"row": {"total": 60}},
+    }
+    r = client.post("/query", json=req)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    row = body["result"]["rows"][0]
+    # Minimal combinations summing to 60: {orders[1], orders[2]} (30+30) and
+    # {orders[3]} (60). Both equal-valued 30-rows stay in their combination.
+    assert row["provenance"]["dnf"] == "(s1 ∧ s2) ∨ (s3)"
+    assert row["provenance"]["dnf_structured"] == [["s1", "s2"], ["s3"]]
+    cf = body["counterfactual"]
+    assert cf["minimal_deletion_sets"] == [
+        ["orders[1]", "orders[3]"],
+        ["orders[2]", "orders[3]"],
+    ]
+    for sc in cf["scenarios"]:
+        assert sc["target_present"] is False
+        # One 30-row and the -60 row remain: the group total becomes -30.
+        assert sc["result"]["rows"] == [{"total": -30}]
+
+
+def test_aggregate_min_max_null_counterfactual(client):
+    req = {
+        "idempotency_key": "key-agg-min-null",
+        "tables": [
+            {
+                "table": "orders",
+                "primary_key": ["oid"],
+                "columns": ["oid", "amount"],
+                "rows": [
+                    {"oid": 1, "amount": 50},
+                    {"oid": 2, "amount": 30},
+                    {"oid": 3, "amount": None},
+                ],
+            }
+        ],
+        "plan": {
+            "type": "aggregate",
+            "input": {"type": "scan", "table": "orders"},
+            "aggregates": [{"fn": "min", "column": "amount", "as": "lo"}],
+        },
+        "explain": {"row": {"lo": 30}},
+    }
+    r = client.post("/query", json=req)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    row = body["result"]["rows"][0]
+    # min=30 is produced by orders[2] alone; the NULL row pins nothing and
+    # never enters the symbol table.
+    assert row["provenance"]["dnf"] == "(s1)"
+    assert row["minimal_witnesses"][0]["labels"] == ["orders[2]"]
+    assert body["symbol_table"] == [{"source": "orders[2]", "symbol": "s1"}]
+    cf = body["counterfactual"]
+    assert cf["minimal_deletion_sets"] == [["orders[2]"]]
+    sc = cf["scenarios"][0]
+    assert sc["target_present"] is False
+    assert sc["result"]["rows"] == [{"lo": 50}]
 
 
 def test_counterfactual_recompute_empty_aggregate(client):

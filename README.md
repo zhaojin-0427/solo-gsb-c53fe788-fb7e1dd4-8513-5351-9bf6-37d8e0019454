@@ -209,16 +209,149 @@ curl -s -X POST http://localhost:8000/query \
 （两条源行合取）；让它消失的最小删除集有两个：删客户 `customers[10]`
 或删订单 `orders[1]`。两种删除都会在重算后使目标消失。
 
-### 多见证（DNF 多析取项）与分组聚合
+### 分组聚合的数值溯源（count / sum / min / max）
 
-对分组聚合而言，输出行即“组”。组的存在性溯源是其成员派生的极小析取；
-让组消失必须命中其所有极小见证。例如组 `cid=10` 含两条订单，溯源为
-`s1 ∨ s2`，唯一的最小删除集是同时删除这两行：
+聚合输出行 = 组键 + 各聚合值。每个聚合表达式都为“这一确切数值”贡献一个
+见证组件，与“组至少剩一行”的存在性组件合取（逐组件取并集）后极小化：
+
+* `count(*)` / `count(col)`：覆盖 **所有参与计数的行**（后者忽略 NULL）
+  —— 一个合取；
+* `sum(col)`：枚举 **和为目标值的全部极小行组合**（按行而非按值，同值行
+  产生不同组合并完整保留）；
+* `min(col)` / `max(col)`：枚举 **仍能产生目标极值的极小组合** —— 每个
+  等于极值的行各成一个见证。
+
+因此同组订单金额为 50 和 30 时，`count=2`、`sum=80` 只在两行都在时成立，
+溯源是单个合取 `s1 ∧ s2`（而不是两条单行见证的析取）；删任一行数值即变，
+最小删除集是两个单例，与删除后重算完全一致。
+
+### 请求：分组聚合 + 解释组 `cid=10`
+
+```bash
+curl -s -X POST http://localhost:8000/query \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "idempotency_key": "readme-agg-1",
+  "tables": [
+    {"table": "orders", "primary_key": ["oid"],
+     "columns": [{"name":"oid","type":"int"},{"name":"cid","type":"int"},{"name":"amount","type":"int"}],
+     "rows": [
+       {"oid":1,"cid":10,"amount":50},
+       {"oid":2,"cid":10,"amount":30},
+       {"oid":3,"cid":20,"amount":10}
+     ]}
+  ],
+  "plan": {
+    "type": "aggregate",
+    "input": {"type":"scan","table":"orders"},
+    "group_by": ["cid"],
+    "aggregates": [
+      {"fn":"count","column":"*","as":"n"},
+      {"fn":"sum","column":"amount","as":"total"}
+    ]
+  },
+  "explain": {"row": {"cid":10,"n":2,"total":80}}
+}'
+```
+
+实际响应（线上传输为单行紧凑 JSON；这里为可读性格式化）：
 
 ```json
-"target_provenance": {"dnf": "(s1) ∨ (s2)", ...},
-"minimal_deletion_sets": [["orders[1]", "orders[2]"]]
+{
+  "status": "ok",
+  "symbol_table": [
+    {"symbol": "s1", "source": "orders[1]"},
+    {"symbol": "s2", "source": "orders[2]"},
+    {"symbol": "s3", "source": "orders[3]"}
+  ],
+  "result": {
+    "columns": ["cid", "n", "total"],
+    "row_count": 2,
+    "rows": [
+      {
+        "row": {"cid": 10, "n": 2, "total": 80},
+        "witness_count": 1,
+        "minimal_witnesses": [
+          {
+            "labels": ["orders[1]", "orders[2]"],
+            "symbols": ["s1", "s2"],
+            "conjunction": "s1 ∧ s2"
+          }
+        ],
+        "provenance": {
+          "dnf": "(s1 ∧ s2)",
+          "dnf_structured": [["s1", "s2"]],
+          "labels_structured": [["orders[1]", "orders[2]"]]
+        }
+      },
+      {
+        "row": {"cid": 20, "n": 1, "total": 10},
+        "witness_count": 1,
+        "minimal_witnesses": [
+          {"labels": ["orders[3]"], "symbols": ["s3"], "conjunction": "s3"}
+        ],
+        "provenance": {
+          "dnf": "(s3)",
+          "dnf_structured": [["s3"]],
+          "labels_structured": [["orders[3]"]]
+        }
+      }
+    ]
+  },
+  "counterfactual": {
+    "target_index": 0,
+    "target": {"cid": 10, "n": 2, "total": 80},
+    "target_provenance": {
+      "dnf": "(s1 ∧ s2)",
+      "dnf_structured": [["s1", "s2"]],
+      "labels_structured": [["orders[1]", "orders[2]"]]
+    },
+    "minimal_deletion_count": 2,
+    "minimal_deletion_sets": [
+      ["orders[1]"],
+      ["orders[2]"]
+    ],
+    "scenarios": [
+      {
+        "delete": ["orders[1]"],
+        "target_present": false,
+        "result": {
+          "columns": ["cid", "n", "total"],
+          "row_count": 2,
+          "rows": [
+            {"cid": 10, "n": 1, "total": 30},
+            {"cid": 20, "n": 1, "total": 10}
+          ]
+        }
+      },
+      {
+        "delete": ["orders[2]"],
+        "target_present": false,
+        "result": {
+          "columns": ["cid", "n", "total"],
+          "row_count": 2,
+          "rows": [
+            {"cid": 10, "n": 1, "total": 50},
+            {"cid": 20, "n": 1, "total": 10}
+          ]
+        }
+      }
+    ]
+  }
+}
 ```
+
+解读：目标行 `(10,2,80)` 的唯一极小见证是 `orders[1] ∧ orders[2]`；
+令它消失的最小删除集是删 `orders[1]` 或 `orders[2]`。两个场景都在删除后
+重算了整条计划：组 `cid=10` 仍在，但变成 `(10,1,30)` / `(10,1,50)`，
+目标行消失（`target_present: false`）——布尔溯源、最小删除集与重算结果
+三者一致。
+
+多见证（DNF 多析取项）在 `sum`/`min`/`max` 出现多种极小组合时产生。例如
+同组金额为 `30, 30, 60, -60` 时 `sum=60` 的极小组合是 `{30,30}` 与 `{60}`，
+溯源为 `(s1 ∧ s2) ∨ (s3)`，最小删除集为 `["orders[1]","orders[3]"]` 和
+`["orders[2]","orders[3]"]`；`min`/`max` 则对每个等于极值的行各给出一个
+单例见证。
 
 ### 幂等重放逐字节一致
 
@@ -260,8 +393,12 @@ cmp a.json b.json && echo "byte-identical"   # byte-identical
 
 * 来源行标签为 `表名[主键值,...]`，复合主键按顺序拼接。符号表把标签稳定映射为
   `s1, s2, ...`（按表名、主键全序排序）。
-* 见证集经过包含极小化：投影去列、自连接等造成的冗余派生会被剔除。
-* 选择、等值连接、投影以及 `count/sum/min/max` 分组聚合对源行集合都是单调的，
-  因此“令输出消失的最小删除集”恰好等于该输出全部极小见证的 **极小命中集**
-  （hypergraph transversal）。聚合输出按组键标识：删除后该组为空即视为消失；
-  每个删除场景都重算整条计划，并显式给出 `target_present`。
+* 见证集经过包含极小化：投影去列、自连接等造成的冗余派生会被剔除；
+  同一标签集合只保留一份，输出按标签全序稳定排序。
+* 选择、等值连接、投影对源行单调；聚合输出的见证把“组存在性”（至少一名
+  成员存活）与每个聚合表达式的数值组件合取：`count` 覆盖所有参与计数的行，
+  `sum`/`min`/`max` 枚举产生目标值的极小行组合。因此“令输出消失的最小
+  删除集”等于该输出全部极小见证的 **极小命中集**（hypergraph transversal）：
+  命中所有见证后，组键或某个聚合值必然改变（对 `sum` 含正负混合值的极端
+  情形，命中集是单调近似；每个删除场景都会 **重算整条计划** 并显式给出
+  `target_present`，以重算结果为准）。

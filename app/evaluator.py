@@ -156,6 +156,47 @@ def prune(witnesses: Iterable[Witness]) -> set[Witness]:
     return {w for w in uniq if not any(o < w for o in uniq)}
 
 
+def cover_witnesses(rows: Iterable[dict]) -> set[Witness]:
+    """Witness family of a *conjunction* of member rows.
+
+    Every row must survive, so each witness picks one witness per row and
+    unions them (cartesian product of the rows' witness families).
+    """
+    result: set[Witness] = {frozenset()}
+    for m in rows:
+        result = {a | b for a in result for b in m["witnesses"]}
+    return prune(result)
+
+
+def minimal_sum_combos(
+    items: list[tuple[dict, Any]], target: Any
+) -> list[tuple[dict, ...]]:
+    """All inclusion-minimal subsets of *items* whose values sum to *target*.
+
+    Rows are matched by identity, so equal-valued rows yield distinct
+    combinations. Once a partial selection already sums to the target no
+    superset of it can be minimal, and with all values non-negative a partial
+    sum above the target can never come back down; both observations prune
+    the backtracking.
+    """
+    n = len(items)
+    non_negative = all(is_number(v) and v >= 0 for _, v in items)
+    combos: list[tuple[dict, ...]] = []
+    # Explicit-stack backtracking over include/exclude decisions; each state
+    # is (next index, accumulated sum, chosen indices).
+    stack: list[tuple[int, Any, tuple[int, ...]]] = [(0, 0, ())]
+    while stack:
+        i, acc, chosen = stack.pop()
+        if acc == target:
+            combos.append(tuple(items[j][0] for j in chosen))
+            continue
+        if i == n or (non_negative and acc > target):
+            continue
+        stack.append((i + 1, acc, chosen))
+        stack.append((i + 1, acc + items[i][1], chosen + (i,)))
+    return combos
+
+
 def merge_relation(rows: Iterable[dict]) -> list[dict]:
     """Merge labeled rows with identical data tuples; prune witnesses."""
     by_data: dict[tuple, set[Witness]] = defaultdict(set)
@@ -556,6 +597,75 @@ class Evaluator:
             )
         return out
 
+    def _agg_component(
+        self, fn: str, col: str | None, names: list[str], members: list[dict]
+    ) -> tuple[Any, set[Witness]]:
+        """Value and witness family of one aggregate expression over a group.
+
+        The family characterises the member-row sets that still produce the
+        value, so that the minimal deletion sets (hitting sets of the row's
+        witnesses) are exactly replayed by recomputation:
+
+        * ``count(*)`` / ``count(col)`` covers every row participating in the
+          count (all members, resp. all members with a non-NULL value): one
+          conjunction over those rows;
+        * ``sum(col)`` enumerates the inclusion-minimal row combinations
+          whose values add up to the target sum;
+        * ``min(col)`` / ``max(col)`` enumerates the inclusion-minimal
+          combinations still yielding the extremum — one per member row equal
+          to it (equal-valued rows give distinct combinations).
+
+        NULLs never participate in ``count(col)``/``sum``/``min``/``max``; an
+        all-NULL aggregate (value NULL) constrains nothing beyond group
+        existence and contributes the trivial family ``{∅}``.
+        """
+        if fn == "count":
+            if col is None or col == "*":
+                counted = list(members)
+            else:
+                ci = names.index(col)
+                counted = [m for m in members if m["data"][ci] is not None]
+            return len(counted), cover_witnesses(counted)
+
+        ci = names.index(col)
+        vals = [(m, m["data"][ci]) for m in members if m["data"][ci] is not None]
+        if fn == "sum":
+            bad = [v for _, v in vals if not is_number(v)]
+            if bad:
+                raise ApiError(
+                    "TYPE_ERROR",
+                    f"sum({col!r}): non-numeric value "
+                    f"{bad[0]!r} ({type_name(bad[0])})",
+                    column=col,
+                )
+            if not vals:
+                return None, {frozenset()}
+            target = 0
+            for _, v in vals:
+                target += v
+            family: set[Witness] = set()
+            for combo in minimal_sum_combos(vals, target):
+                family |= cover_witnesses(combo)
+            return target, prune(family)
+
+        # min / max
+        kinds = {type_name(v) for _, v in vals}
+        non_numeric = kinds - {"number"}
+        if non_numeric and ({"number"} & kinds or len(non_numeric) > 1):
+            raise ApiError(
+                "TYPE_ERROR",
+                f"{fn}({col!r}): cannot order mixed types {sorted(kinds)}",
+                column=col,
+            )
+        if not vals:
+            return None, {frozenset()}
+        target = (min if fn == "min" else max)(v for _, v in vals)
+        family = set()
+        for m, v in vals:
+            if v == target:
+                family |= m["witnesses"]
+        return target, prune(family)
+
     def _aggregate(self, node: dict) -> list[dict]:
         src_node = self._input(node)
         gb = node.get("group_by", [])
@@ -616,47 +726,22 @@ class Evaluator:
         for gkey, members in groups.items():
             real_key = gkey[1:] if gkey and gkey[0] is NULL_KEY else gkey
             data: list[Any] = list(real_key)
-            group_witnesses: set[Witness] = set()
+            # Witness components that must all hold for this exact output row:
+            #   1. group existence — at least one member row survives;
+            #   2. one component per aggregate expression pinning its value.
+            # The row's witnesses are the conjunction (pairwise union) of the
+            # component families, pruned to inclusion-minimal sets.
+            families: list[set[Witness]] = []
+            existence: set[Witness] = set()
             for m in members:
-                group_witnesses.update(m["witnesses"])
+                existence.update(m["witnesses"])
+            families.append(prune(existence))
             for fn, col, asname in aggs:
-                if fn == "count":
-                    if col is None or col == "*":
-                        vals = [1 for _ in members]
-                    else:
-                        vals = [
-                            m["data"][names.index(col)]
-                            for m in members
-                            if m["data"][names.index(col)] is not None
-                        ]
-                    data.append(len(vals))
-                else:
-                    raw = [m["data"][names.index(col)] for m in members]
-                    vals = [v for v in raw if v is not None]
-                    if fn == "sum":
-                        bad = [v for v in vals if not is_number(v)]
-                        if bad:
-                            raise ApiError(
-                                "TYPE_ERROR",
-                                f"sum({col!r}): non-numeric value "
-                                f"{bad[0]!r} ({type_name(bad[0])})",
-                                column=col,
-                            )
-                        data.append(sum(vals) if vals else None)
-                    elif fn in ("min", "max"):
-                        kinds = {type_name(v) for v in vals}
-                        non_numeric = kinds - {"number"}
-                        if non_numeric and ({"number"} & kinds or len(non_numeric) > 1):
-                            raise ApiError(
-                                "TYPE_ERROR",
-                                f"{fn}({col!r}): cannot order mixed types "
-                                f"{sorted(kinds)}",
-                                column=col,
-                            )
-                        data.append((min if fn == "min" else max)(vals) if vals else None)
-            # A group survives iff at least one member survives: its minimal
-            # witnesses are the inclusion-minimal member witnesses.
-            out_rows.append(
-                {"data": tuple(data), "witnesses": prune(group_witnesses)}
-            )
+                value, family = self._agg_component(fn, col, names, members)
+                data.append(value)
+                families.append(family)
+            witnesses: set[Witness] = {frozenset()}
+            for family in families:
+                witnesses = prune({a | b for a in witnesses for b in family})
+            out_rows.append({"data": tuple(data), "witnesses": witnesses})
         return merge_relation(out_rows)

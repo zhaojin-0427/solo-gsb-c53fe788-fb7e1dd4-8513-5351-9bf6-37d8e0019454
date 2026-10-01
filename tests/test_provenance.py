@@ -105,15 +105,130 @@ def test_aggregate_group_witnesses():
     rows = ev.eval(plan)
     cols = ev.schema(plan)
     g10 = next(r for r in rows if r["data"][cols.index("cust")] == 10)
-    # each single member is a minimal group witness
-    assert g10["witnesses"] == {frozenset([L("orders", 1)]), frozenset([L("orders", 2)])}
+    # count(*)=2 covers both members; sum=12 has the single minimal combo
+    # {1,2}; min=5 pins row 1 and max=7 pins row 2. The conjunction of all
+    # components requires both rows.
+    assert g10["witnesses"] == {frozenset([L("orders", 1), L("orders", 2)])}
     data = dict(zip(cols, g10["data"]))
     assert data == {"cust": 10, "n": 2, "total": 12, "lo": 5, "hi": 7}
 
-    # To empty the group both members must go: the two singleton witnesses
-    # form a hypergraph with a single minimal transversal {1, 2}.
+    # Deleting either member changes the aggregate values, so each singleton
+    # is a minimal deletion set — matching recomputation.
     hs = minimal_hitting_sets(g10["witnesses"])
-    assert hs == [frozenset([L("orders", 1), L("orders", 2)])]
+    assert hs == [frozenset([L("orders", 1)]), frozenset([L("orders", 2)])]
+
+
+def test_aggregate_min_max_witnesses():
+    tables = [
+        {
+            "table": "orders",
+            "primary_key": ["oid"],
+            "columns": ["oid", "amt"],
+            "rows": [
+                {"oid": 1, "amt": 50},
+                {"oid": 2, "amt": 30},
+                {"oid": 3, "amt": 30},
+            ],
+        }
+    ]
+    plan = {
+        "type": "aggregate",
+        "input": {"type": "scan", "table": "orders"},
+        "aggregates": [{"fn": "min", "column": "amt", "as": "lo"}],
+    }
+    ev = make_evaluator(tables)
+    rows = ev.eval(plan)
+    # min=30: each equal-valued row is a minimal combo on its own.
+    assert rows[0]["witnesses"] == {
+        frozenset([L("orders", 2)]),
+        frozenset([L("orders", 3)]),
+    }
+    hs = minimal_hitting_sets(rows[0]["witnesses"])
+    assert hs == [frozenset([L("orders", 2), L("orders", 3)])]
+
+
+def test_aggregate_sum_minimal_combos():
+    from app.evaluator import minimal_sum_combos
+
+    tables = [
+        {
+            "table": "orders",
+            "primary_key": ["oid"],
+            "columns": ["oid", "amt"],
+            "rows": [
+                {"oid": 1, "amt": 50},
+                {"oid": 2, "amt": 30},
+                {"oid": 3, "amt": 0},
+            ],
+        }
+    ]
+    plan = {
+        "type": "aggregate",
+        "input": {"type": "scan", "table": "orders"},
+        "aggregates": [{"fn": "sum", "column": "amt", "as": "total"}],
+    }
+    ev = make_evaluator(tables)
+    rows = ev.eval(plan)
+    # The zero-valued row never participates in a minimal sum combination.
+    assert rows[0]["data"] == (80,)
+    assert rows[0]["witnesses"] == {frozenset([L("orders", 1), L("orders", 2)])}
+
+    # Equal-valued rows keep distinct combinations: 30a+30b and 60 both hit 60.
+    items = [
+        ({"id": "a"}, 30),
+        ({"id": "b"}, 30),
+        ({"id": "c"}, 60),
+    ]
+    combos = minimal_sum_combos(items, 60)
+    assert {tuple(m["id"] for m in c) for c in combos} == {("a", "b"), ("c",)}
+    # Negative values: only the full set sums to the target.
+    items = [({"id": "a"}, 50), ({"id": "b"}, 30), ({"id": "c"}, -10)]
+    combos = minimal_sum_combos(items, 70)
+    assert {tuple(m["id"] for m in c) for c in combos} == {("a", "b", "c")}
+
+
+def test_aggregate_null_components():
+    tables = [
+        {
+            "table": "t",
+            "primary_key": ["id"],
+            "columns": ["id", "v"],
+            "rows": [
+                {"id": 1, "v": 50},
+                {"id": 2, "v": None},
+            ],
+        }
+    ]
+    plan = {
+        "type": "aggregate",
+        "input": {"type": "scan", "table": "t"},
+        "aggregates": [
+            {"fn": "count", "column": "v", "as": "n"},
+            {"fn": "sum", "column": "v", "as": "total"},
+        ],
+    }
+    ev = make_evaluator(tables)
+    rows = ev.eval(plan)
+    # count(v)=1 and sum=50 ignore the NULL row: only row 1 is pinned.
+    assert rows[0]["data"] == (1, 50)
+    assert rows[0]["witnesses"] == {frozenset([L("t", 1)])}
+
+    # All-NULL sum/min/max: value NULL, only group existence is pinned.
+    plan_null = {
+        "type": "aggregate",
+        "input": {
+            "type": "filter",
+            "input": {"type": "scan", "table": "t"},
+            "predicate": {"column": "v", "op": "is_null"},
+        },
+        "aggregates": [
+            {"fn": "count", "column": "v", "as": "n"},
+            {"fn": "sum", "column": "v", "as": "total"},
+        ],
+    }
+    rows = ev.eval(plan_null)
+    assert rows[0]["data"] == (0, None)
+    assert rows[0]["witnesses"] == {frozenset([L("t", 2)])}
 
 
 def test_empty_aggregate_input():
