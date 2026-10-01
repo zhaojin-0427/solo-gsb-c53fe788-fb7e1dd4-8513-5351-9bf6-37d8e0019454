@@ -14,11 +14,28 @@ Supported plan nodes (each is an object with a ``type``):
 
 Every intermediate relation is a list of *labeled rows*::
 
-    {"data": (v1, v2, ...), "witnesses": set[frozenset[label]]}
+    {"data": (v1, v2, ...),
+     "witnesses": set[frozenset[label]],   # minimal why-witnesses (DNF)
+     "killers": set[frozenset[label]] | None}
 
-Rows with identical data are merged (set semantics); their witness sets are
-unioned and pruned to inclusion-minimal witnesses. A label is a
+Rows with identical data are merged (set semantics); their witness sets and
+killer sets are unioned and pruned to inclusion-minimal sets. A label is a
 ``(table, pk-tuple)`` pair identifying one submitted source row.
+
+Witnesses vs killers
+--------------------
+``witnesses`` are the standard why-provenance witnesses: a row is derivable
+from a sub-snapshot containing one full witness. For the monotone operators
+(scan/filter/equi-join/project) the minimal deletion sets are exactly the
+minimal hitting sets of the witnesses.
+
+Exact-value aggregates are not monotone in that sense (a surviving witness
+does not protect the value from other surviving rows, e.g. ``sum`` with zeros
+or mixed signs), so aggregate rows additionally carry exact ``killers``:
+the inclusion-minimal sets of source rows whose deletion makes *that exact
+output row* disappear on recomputation. Operators above an aggregate lift
+the killers of their inputs; rows without an aggregate below them leave
+``killers`` as ``None`` and fall back to hitting sets of their witnesses.
 """
 from __future__ import annotations
 
@@ -150,28 +167,176 @@ class Table:
 # Witness utilities
 # ---------------------------------------------------------------------------
 
-def prune(witnesses: Iterable[Witness]) -> set[Witness]:
-    """Keep only inclusion-minimal witnesses."""
-    uniq = set(witnesses)
+def prune(family: Iterable[frozenset]) -> set[frozenset]:
+    """Keep only inclusion-minimal members of a family of frozensets."""
+    uniq = set(family)
     return {w for w in uniq if not any(o < w for o in uniq)}
 
 
+def conjoin_families(
+    left: Iterable[frozenset[int]],
+    right: Iterable[frozenset[int]],
+) -> set[frozenset[int]]:
+    """All inclusion-minimal unions ``l | r`` (DNF conjunction operator).
+
+    Used to combine the requirements of several aggregates in one aggregate
+    node: a witness for the whole output row must satisfy every aggregate.
+    """
+    return prune(l | r for l in left for r in right)
+
+
+def combine_breaker_clauses(
+    clauses: list[set[frozenset[int]]],
+) -> set[frozenset[int]]:
+    """Minimal member deletions breaking at least one clause.
+
+    The exact output row remains iff *all* requirements hold (group exists,
+    count equals the target, sum equals the target, min/max equal the
+    targets), so it disappears when *any* clause is broken. The minimal
+    such deletions are therefore the inclusion-minimal members of the union
+    of the clauses' own minimal breakers.
+
+    Caveat: with mixed-sign sums the "sum breaks" event is not monotone
+    under adding more deleted members (cancellations can restore the
+    target). Callers therefore re-validate the lifted base-row sets by
+    recomputation.
+    """
+    pooled: set[frozenset[int]] = set()
+    for clause in clauses:
+        pooled |= clause
+    return prune(pooled)
+
+
+def minimal_sum_subsets(values: list, target) -> set[frozenset[int]]:
+    """All inclusion-minimal sets of indices whose ``values`` sum to *target*.
+
+    Combinations with equal values are kept as distinct index combinations:
+    rows 50(a) and 50(b) yield two different witnesses. Works for ints and
+    floats (exact arithmetic, matching the evaluator's own ``sum``), negative
+    values and zeros; non-minimal matches produced via zero entries are
+    pruned at the end.
+    """
+    # Sort indices by descending magnitude so that same-sign prefix bounds are
+    # tight. Index identities are preserved, so equal values stay distinct.
+    order = sorted(range(len(values)), key=lambda i: -abs(values[i]))
+    n = len(values)
+    positive = all(values[i] > 0 for i in range(n))
+    negative = all(values[i] < 0 for i in range(n))
+    results: set[frozenset[int]] = set()
+
+    def dfs(pos: int, chosen: frozenset[int], acc) -> None:
+        if acc == target and chosen:
+            results.add(chosen)
+            # Any extension sums to target only by adding net-zero entries,
+            # which can never be inclusion-minimal.
+            return
+        if pos >= n:
+            return
+        # Same-sign prefix bound: remaining magnitudes (descending) cannot
+        # close a positive (resp. negative) gap past their raw sum.
+        rem = order[pos:]
+        if positive or negative:
+            total_rem = sum(values[i] for i in rem)
+            if positive:
+                if target > 0 and acc > target:
+                    return
+                if acc + total_rem < target:
+                    return
+            else:
+                if target < 0 and acc < target:
+                    return
+                if acc + total_rem > target:
+                    return
+        idx = rem[0]
+        dfs(pos + 1, chosen | {idx}, acc + values[idx])
+        dfs(pos + 1, chosen, acc)
+
+    dfs(0, frozenset(), 0)
+    return prune(results)
+
+
 def merge_relation(rows: Iterable[dict]) -> list[dict]:
-    """Merge labeled rows with identical data tuples; prune witnesses."""
+    """Merge labeled rows with identical data tuples; prune witnesses/killers."""
     by_data: dict[tuple, set[Witness]] = defaultdict(set)
+    killers_by_data: dict[tuple, set[Witness]] = defaultdict(set)
+    have_killers: dict[tuple, bool] = defaultdict(bool)
     for r in rows:
         by_data[r["data"]].update(r["witnesses"])
-    out = [
-        {"data": data, "witnesses": prune(ws)}
-        for data, ws in by_data.items()
-    ]
+        if r.get("killers") is not None:
+            killers_by_data[r["data"]].update(r["killers"])
+            have_killers[r["data"]] = True
+    out = []
+    for data, ws in by_data.items():
+        entry: dict = {"data": data, "witnesses": prune(ws)}
+        entry["killers"] = prune(killers_by_data[data]) if have_killers[data] else None
+        out.append(entry)
     out.sort(key=lambda r: tuple_sort_key(r["data"]))
     return out
 
 
+# ---------------------------------------------------------------------------
+# Minimal hitting sets (minimal transversals)
+# ---------------------------------------------------------------------------
+
+def _label_sort_key(label: Label):
+    from .values import value_sort_key
+
+    return (label[0], tuple(value_sort_key(p) for p in label[1]))
+
+
+def minimal_hitting_sets(witnesses: Iterable[Witness]) -> list[Witness]:
+    """All inclusion-minimal sets H with H ∩ W ≠ ∅ for every witness W.
+
+    For a monotone operator these are exactly the minimal source-row
+    deletion sets that make the output row disappear.
+    """
+    edges = tuple(frozenset(w) for w in witnesses if w)
+    memo: dict[frozenset, set[Witness]] = {}
+
+    def rec(edges: tuple[Witness, ...]) -> set[Witness]:
+        key = frozenset(edges)
+        if key in memo:
+            return memo[key]
+        if not edges:
+            return {frozenset()}
+
+        # Pick the smallest edge to branch on (keeps the recursion narrow).
+        e = min(edges, key=len)
+        results: set[Witness] = set()
+        for v in e:
+            # Choosing v covers e and every edge containing v; the residual
+            # hypergraph is all remaining edges (intact) that v does not hit.
+            remaining = tuple(x for x in edges if v not in x)
+            for sub in rec(remaining):
+                results.add(frozenset(sub | {v}))
+        # Prune non-minimal solutions introduced on this branch.
+        minimal = {h for h in results if not any(o < h for o in results)}
+        memo[key] = minimal
+        return minimal
+
+    hitting = rec(edges)
+    return sorted(
+        hitting,
+        key=lambda h: [_label_sort_key(l) for l in sorted(h, key=_label_sort_key)],
+    )
+
+
+def row_killers(row: dict) -> set[Witness]:
+    """Exact minimal deletion sets of an output row.
+
+    Rows produced above an aggregate node carry precomputed ``killers``;
+    every other row is monotone, so its minimal deletion sets are the
+    minimal hitting sets of its witnesses.
+    """
+    if row.get("killers") is not None:
+        return row["killers"]
+    return set(minimal_hitting_sets(row["witnesses"]))
+
+
 class Evaluator:
-    def __init__(self, tables: dict[str, Table]):
+    def __init__(self, tables: dict[str, Table], *, with_provenance: bool = True):
         self.tables = tables
+        self.with_provenance = with_provenance
         self._cache: dict[int, list[dict]] = {}
 
     # -- node helpers -------------------------------------------------------
@@ -391,6 +556,7 @@ class Evaluator:
                 {
                     "data": tuple(r["data"][i] for i in idx),
                     "witnesses": set(r["witnesses"]),
+                    "killers": set(r["killers"]) if r.get("killers") is not None else None,
                 }
             )
         return merge_relation(produced)
@@ -504,7 +670,24 @@ class Evaluator:
                 for lw in lr["witnesses"]:
                     for rw in rr["witnesses"]:
                         witnesses.add(frozenset(lw | rw))
-                produced.append({"data": tuple(data), "witnesses": witnesses})
+                # A joined tuple disappears when its left contribution or
+                # its right contribution is killed; the two families are
+                # alternatives (disjunction, pruned). A side without an
+                # aggregate below it has no precomputed killers, in which
+                # case the whole joined row falls back to witness hitting
+                # sets.
+                lk = lr.get("killers")
+                rk = rr.get("killers")
+                if lk is not None or rk is not None:
+                    killers: set[Witness] | None = set()
+                    if lk is not None:
+                        killers.update(lk)
+                    if rk is not None:
+                        killers.update(rk)
+                    killers = prune(killers)
+                else:
+                    killers = None
+                produced.append({"data": tuple(data), "witnesses": witnesses, "killers": killers})
         return merge_relation(produced)
 
     # -- aggregate ----------------------------------------------------------
@@ -616,47 +799,318 @@ class Evaluator:
         for gkey, members in groups.items():
             real_key = gkey[1:] if gkey and gkey[0] is NULL_KEY else gkey
             data: list[Any] = list(real_key)
-            group_witnesses: set[Witness] = set()
-            for m in members:
-                group_witnesses.update(m["witnesses"])
+
+            # Value-only mode (used while validating provenance by
+            # recomputation): compute aggregate values without any
+            # witness/killer bookkeeping.
+            if not self.with_provenance:
+                self._append_aggregate_values(data, members, names, aggs)
+                out_rows.append(
+                    {"data": tuple(data), "witnesses": set(), "killers": None}
+                )
+                continue
+
+            # Member-level provenance, as index sets into ``members``:
+            #   good_family  — inclusion-minimal member subsets that derive
+            #                  *this exact output row* (one DNF conjunction
+            #                  per member subset; group existence is required);
+            #   bad_family   — inclusion-minimal member subsets whose deletion
+            #                  makes *this exact output row* disappear.
+            # Each aggregate contributes one requirement to each family.
+            good_family: set[frozenset[int]] = {frozenset()}
+            # One clause per aggregate: the alternatives that change that
+            # aggregate's value. Group-emptiness is appended as a final clause.
+            bad_clauses: list[set[frozenset[int]]] = []
+
+            def col_values(column: str) -> list[Any]:
+                ci = names.index(column)
+                return [m["data"][ci] for m in members]
+
             for fn, col, asname in aggs:
                 if fn == "count":
                     if col is None or col == "*":
-                        vals = [1 for _ in members]
+                        eligible = list(range(len(members)))
                     else:
-                        vals = [
-                            m["data"][names.index(col)]
-                            for m in members
-                            if m["data"][names.index(col)] is not None
-                        ]
-                    data.append(len(vals))
-                else:
-                    raw = [m["data"][names.index(col)] for m in members]
-                    vals = [v for v in raw if v is not None]
-                    if fn == "sum":
-                        bad = [v for v in vals if not is_number(v)]
-                        if bad:
-                            raise ApiError(
-                                "TYPE_ERROR",
-                                f"sum({col!r}): non-numeric value "
-                                f"{bad[0]!r} ({type_name(bad[0])})",
-                                column=col,
-                            )
-                        data.append(sum(vals) if vals else None)
-                    elif fn in ("min", "max"):
-                        kinds = {type_name(v) for v in vals}
-                        non_numeric = kinds - {"number"}
-                        if non_numeric and ({"number"} & kinds or len(non_numeric) > 1):
-                            raise ApiError(
-                                "TYPE_ERROR",
-                                f"{fn}({col!r}): cannot order mixed types "
-                                f"{sorted(kinds)}",
-                                column=col,
-                            )
-                        data.append((min if fn == "min" else max)(vals) if vals else None)
-            # A group survives iff at least one member survives: its minimal
-            # witnesses are the inclusion-minimal member witnesses.
+                        vals_col = col_values(col)
+                        eligible = [i for i, v in enumerate(vals_col) if v is not None]
+                    target = len(eligible)
+                    data.append(target)
+                    # count follows the usual count(*)/count(column) rule:
+                    # every counted row participates in the single witness;
+                    # killing any one of them changes the count.
+                    req_good = {frozenset(eligible)} if eligible else {frozenset()}
+                    req_bad = {frozenset({i}) for i in eligible}
+                    good_family = conjoin_families(good_family, req_good)
+                    if req_bad:
+                        bad_clauses.append(req_bad)
+                    continue
+
+                raw = col_values(col)
+                vals = [(i, v) for i, v in enumerate(raw) if v is not None]
+                if fn == "sum":
+                    bad_v = [v for _, v in vals if not is_number(v)]
+                    if bad_v:
+                        raise ApiError(
+                            "TYPE_ERROR",
+                            f"sum({col!r}): non-numeric value "
+                            f"{bad_v[0]!r} ({type_name(bad_v[0])})",
+                            column=col,
+                        )
+                    target = sum(v for _, v in vals) if vals else None
+                    data.append(target)
+                    if vals:
+                        idx_order = [i for i, _ in vals]
+                        nums = [v for _, v in vals]
+                        combos = minimal_sum_subsets(nums, target)
+                        req_good = {
+                            frozenset(idx_order[k] for k in combo) for combo in combos
+                        }
+                        # sum changes iff deleted non-null values have a
+                        # nonzero sum; the minimal such subsets are singletons
+                        # over nonzero values (a zero-only subset sums to 0
+                        # and never matters).
+                        req_bad = {
+                            frozenset({idx_order[j]})
+                            for j, v in enumerate(nums)
+                            if v != 0
+                        }
+                    else:
+                        # NULL sum: any single all-NULL member witnesses it;
+                        # a NULL must remain (the group may stay non-empty).
+                        req_good = {frozenset({i}) for i, _ in vals} or {frozenset()}
+                        req_bad = set()
+                    good_family = conjoin_families(good_family, req_good)
+                    if req_bad:
+                        bad_clauses.append(req_bad)
+                elif fn in ("min", "max"):
+                    kinds = {type_name(v) for _, v in vals}
+                    non_numeric = kinds - {"number"}
+                    if non_numeric and ({"number"} & kinds or len(non_numeric) > 1):
+                        raise ApiError(
+                            "TYPE_ERROR",
+                            f"{fn}({col!r}): cannot order mixed types "
+                            f"{sorted(kinds)}",
+                            column=col,
+                        )
+                    target = (
+                        (min if fn == "min" else max)(v for _, v in vals)
+                        if vals
+                        else None
+                    )
+                    data.append(target)
+                    if vals:
+                        extremal = {i for i, v in vals if v == target}
+                        # Any one extremal member produces the target
+                        # extremum; the target disappears only once *all*
+                        # extremal members are deleted.
+                        req_good = {frozenset({i}) for i in extremal}
+                        req_bad = {frozenset(extremal)}
+                    else:
+                        req_good = {frozenset({i}) for i, _ in vals} or {frozenset()}
+                        req_bad = set()
+                    good_family = conjoin_families(good_family, req_good)
+                    if req_bad:
+                        bad_clauses.append(req_bad)
+
+            # Group existence: at least one member must survive. Conjoin the
+            # group-existence requirement (the member singletons) with the
+            # aggregate requirements, dropping non-minimal combinations.
+            existence = {frozenset({i}) for i in range(len(members))}
+            good_family = conjoin_families(good_family, existence)
+            # The exact output row disappears as soon as *one* requirement
+            # breaks (count changes / sum changes / an extremum disappears /
+            # the group empties): pool the clauses' minimal breakers.
+            bad_clauses.append({frozenset(range(len(members)))})
+            bad_family = combine_breaker_clauses(bad_clauses)
+
+            target_data = tuple(data)
+            row_witnesses, row_killers = self._lift_aggregate_provenance(
+                node, members, good_family, bad_family, target_data
+            )
+
             out_rows.append(
-                {"data": tuple(data), "witnesses": prune(group_witnesses)}
+                {
+                    "data": target_data,
+                    "witnesses": row_witnesses,
+                    "killers": row_killers,
+                }
             )
         return merge_relation(out_rows)
+
+    # -- aggregate provenance lifting --------------------------------------
+
+    @staticmethod
+    def _append_aggregate_values(
+        data: list[Any],
+        members: list[dict],
+        names: list[str],
+        aggs: list,
+    ) -> None:
+        """Append count/sum/min/max values for one group onto *data*."""
+
+        def col_values(column: str) -> list[Any]:
+            ci = names.index(column)
+            return [m["data"][ci] for m in members]
+
+        for fn, col, _asname in aggs:
+            if fn == "count":
+                if col is None or col == "*":
+                    eligible = members
+                else:
+                    eligible = [v for v in col_values(col) if v is not None]
+                data.append(len(eligible))
+                continue
+            vals = [v for v in col_values(col) if v is not None]
+            if fn == "sum":
+                bad = [v for v in vals if not is_number(v)]
+                if bad:
+                    raise ApiError(
+                        "TYPE_ERROR",
+                        f"sum({col!r}): non-numeric value "
+                        f"{bad[0]!r} ({type_name(bad[0])})",
+                        column=col,
+                    )
+                data.append(sum(vals) if vals else None)
+            else:  # min / max
+                kinds = {type_name(v) for v in vals}
+                non_numeric = kinds - {"number"}
+                if non_numeric and ({"number"} & kinds or len(non_numeric) > 1):
+                    raise ApiError(
+                        "TYPE_ERROR",
+                        f"{fn}({col!r}): cannot order mixed types "
+                        f"{sorted(kinds)}",
+                        column=col,
+                    )
+                data.append((min if fn == "min" else max)(vals) if vals else None)
+
+    # Max size of a group's source-label universe for which every sub-snapshot
+    # is enumerated exactly. 2**12 = 4096 recomputations per group.
+    _EXACT_SWEEP_LIMIT = 12
+
+    def _lift_aggregate_provenance(
+        self,
+        node: dict,
+        members: list[dict],
+        good_family: set[frozenset[int]],
+        bad_family: set[frozenset[int]],
+        target_data: tuple,
+    ) -> tuple[set[Witness], set[Witness]]:
+        """Lift member-level witness/killer families to source-label sets.
+
+        Simple groups (every member has one singleton witness, labels
+        disjoint — e.g. groups directly over a scan/filter) lift
+        combinatorially and the result is exact.
+
+        Complex groups (members derived through joins, self-joins or
+        sub-aggregates, where witnesses may share base rows) are validated
+        by actually recomputing the plan on the reduced snapshot, because
+        shared labels and non-monotone aggregate values (mixed-sign sums)
+        can invalidate a naive lift. For small label universes an exhaustive
+        sub-snapshot sweep gives the exact answer; otherwise only validated,
+        inclusion-minimal lifted candidates are reported.
+        """
+        lifted_w: set[Witness] = set()
+        for combo in good_family:
+            lifted_w.update(self._lift_good(combo, members))
+        lifted_k: set[Witness] = set()
+        for deleted in bad_family:
+            lifted_k.update(self._lift_bad(deleted, members))
+
+        universe: set[Label] = set()
+        for m in members:
+            for w in m["witnesses"]:
+                universe.update(w)
+
+        simple = len(members) == len(universe) and all(
+            len(m["witnesses"]) == 1 and len(next(iter(m["witnesses"]))) == 1
+            for m in members
+        )
+        if simple:
+            return prune(lifted_w), prune(lifted_k)
+
+        if len(universe) <= self._EXACT_SWEEP_LIMIT:
+            return self._exact_provenance_sweep(node, universe, target_data)
+
+        validated_w = {
+            w for w in prune(lifted_w)
+            if self._target_present(node, universe - w, target_data)
+        }
+        validated_k = {
+            h for h in prune(lifted_k)
+            if not self._target_present(node, h, target_data)
+        }
+        return prune(validated_w), prune(validated_k)
+
+    def _exact_provenance_sweep(
+        self,
+        node: dict,
+        universe: set[Label],
+        target_data: tuple,
+    ) -> tuple[set[Witness], set[Witness]]:
+        """Enumerate every subset of *universe* and read provenance off it.
+
+        A surviving subset under which the target is present is a witness
+        candidate; a deleted subset under which it is absent is a killer
+        candidate. Both families are pruned to inclusion-minimal members,
+        so the result is exact (and automatically consistent with
+        recomputation), including NULLs, ties and mixed-sign sums.
+        """
+        labels = list(universe)
+        n = len(labels)
+        witnesses: set[Witness] = set()
+        killers: set[Witness] = set()
+        for mask in range(1 << n):
+            deleted = frozenset(labels[i] for i in range(n) if not (mask >> i) & 1)
+            if self._target_present(node, deleted, target_data):
+                witnesses.add(frozenset(universe - deleted))
+            else:
+                killers.add(deleted)
+        return prune(witnesses), prune(killers)
+
+    def _target_present(
+        self, node: dict, deleted: frozenset[Label], target_data: tuple
+    ) -> bool:
+        """Recompute the full aggregate node after deleting *deleted*."""
+        by_table: dict[str, set[tuple]] = {}
+        for lab in deleted:
+            by_table.setdefault(lab[0], set()).add(lab[1])
+        filtered = {
+            name: t.filtered_copy(by_table.get(name, set()))
+            for name, t in self.tables.items()
+        }
+        try:
+            out = Evaluator(filtered, with_provenance=False).eval(node)
+        except ApiError:
+            # Empty aggregate input (group cannot be formed at all).
+            return False
+        return any(r["data"] == target_data for r in out)
+
+    @staticmethod
+    def _lift_good(combo: frozenset[int], members: list[dict]) -> set[Witness]:
+        """Witness conjunctions of one why-witness per member in *combo*."""
+        lifted: set[Witness] = {frozenset()}
+        for i in combo:
+            lifted = {
+                frozenset(w | v)
+                for w in lifted
+                for v in members[i]["witnesses"]
+            }
+        return prune(lifted)
+
+    @staticmethod
+    def _lift_bad(deleted: frozenset[int], members: list[dict]) -> set[Witness]:
+        """Source-row deletions that eliminate every member in *deleted*.
+
+        Each member must lose all of its derivations, so its witness
+        hypergraph must be hit; choices across members combine conjunctively.
+        """
+        lifted: set[Witness] = {frozenset()}
+        for i in deleted:
+            hits = set(minimal_hitting_sets(members[i]["witnesses"]))
+            lifted = {
+                frozenset(h | v)
+                for h in hits
+                for v in lifted
+            }
+            lifted = prune(lifted)
+        return lifted

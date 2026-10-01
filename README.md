@@ -209,16 +209,143 @@ curl -s -X POST http://localhost:8000/query \
 （两条源行合取）；让它消失的最小删除集有两个：删客户 `customers[10]`
 或删订单 `orders[1]`。两种删除都会在重算后使目标消失。
 
-### 多见证（DNF 多析取项）与分组聚合
+### 请求：分组聚合（count/sum/min/max）的数值溯源
 
-对分组聚合而言，输出行即“组”。组的存在性溯源是其成员派生的极小析取；
-让组消失必须命中其所有极小见证。例如组 `cid=10` 含两条订单，溯源为
-`s1 ∨ s2`，唯一的最小删除集是同时删除这两行：
+订单 `orders[1]=50`、`orders[2]=30` 同属 `cid=10` 组：`count(*)=2`、
+`sum(amount)=80`、`min=30`、`max=50`。**这一整行输出的唯一极小见证是
+两行的合取 `s1 ∧ s2`**（count 覆盖全部参与计数的行；sum=80 只能由 `{50,30}`
+极小地凑出；min/max 分别需要产生极值的行）；让该输出行消失的最小删除集
+是删除 `orders[1]` 或删除 `orders[2]` 两个单元素集——删除后组仍然存在，
+但值变为 `n=1,total=30`（或 50），不再是被解释的那一行。反事实删除集与
+删除后的真实重算逐场景一致。
+
+```bash
+curl -s -X POST http://localhost:8000/query \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "idempotency_key": "readme-agg-1",
+  "tables": [
+    {"table": "orders", "primary_key": ["oid"],
+     "columns": [{"name":"oid","type":"int"},{"name":"cid","type":"int"},{"name":"amount","type":"int"}],
+     "rows": [{"oid":1,"cid":10,"amount":50},{"oid":2,"cid":10,"amount":30},
+              {"oid":3,"cid":20,"amount":5},{"oid":4,"cid":20,"amount":null}]}
+  ],
+  "plan": {
+    "type": "aggregate",
+    "input": {"type": "scan", "table": "orders"},
+    "group_by": ["cid"],
+    "aggregates": [
+      {"fn": "count", "column": "*", "as": "n"},
+      {"fn": "sum", "column": "amount", "as": "total"},
+      {"fn": "min", "column": "amount", "as": "low"},
+      {"fn": "max", "column": "amount", "as": "high"}
+    ]
+  },
+  "explain": {"row": {"cid":10,"n":2,"total":80,"low":30,"high":50}}
+}'
+```
+
+实际响应（线上传输为单行紧凑 JSON；这里为可读性格式化）：
 
 ```json
-"target_provenance": {"dnf": "(s1) ∨ (s2)", ...},
-"minimal_deletion_sets": [["orders[1]", "orders[2]"]]
+{
+  "status": "ok",
+  "symbol_table": [
+    {"symbol": "s1", "source": "orders[1]"},
+    {"symbol": "s2", "source": "orders[2]"},
+    {"symbol": "s3", "source": "orders[3]"},
+    {"symbol": "s4", "source": "orders[4]"}
+  ],
+  "result": {
+    "columns": ["cid", "n", "total", "low", "high"],
+    "row_count": 2,
+    "rows": [
+      {
+        "row": {"cid": 10, "n": 2, "total": 80, "low": 30, "high": 50},
+        "witness_count": 1,
+        "minimal_witnesses": [
+          {
+            "labels": ["orders[1]", "orders[2]"],
+            "symbols": ["s1", "s2"],
+            "conjunction": "s1 ∧ s2"
+          }
+        ],
+        "provenance": {
+          "dnf": "(s1 ∧ s2)",
+          "dnf_structured": [["s1", "s2"]],
+          "labels_structured": [["orders[1]", "orders[2]"]]
+        }
+      },
+      {
+        "row": {"cid": 20, "n": 2, "total": 5, "low": 5, "high": 5},
+        "witness_count": 1,
+        "minimal_witnesses": [
+          {
+            "labels": ["orders[3]", "orders[4]"],
+            "symbols": ["s3", "s4"],
+            "conjunction": "s3 ∧ s4"
+          }
+        ],
+        "provenance": {
+          "dnf": "(s3 ∧ s4)",
+          "dnf_structured": [["s3", "s4"]],
+          "labels_structured": [["orders[3]", "orders[4]"]]
+        }
+      }
+    ]
+  },
+  "counterfactual": {
+    "target_index": 0,
+    "target": {"cid": 10, "n": 2, "total": 80, "low": 30, "high": 50},
+    "target_provenance": {
+      "dnf": "(s1 ∧ s2)",
+      "dnf_structured": [["s1", "s2"]],
+      "labels_structured": [["orders[1]", "orders[2]"]]
+    },
+    "minimal_deletion_count": 2,
+    "minimal_deletion_sets": [
+      ["orders[1]"],
+      ["orders[2]"]
+    ],
+    "scenarios": [
+      {
+        "delete": ["orders[1]"],
+        "target_present": false,
+        "result": {
+          "columns": ["cid", "n", "total", "low", "high"],
+          "row_count": 2,
+          "rows": [
+            {"cid": 10, "n": 1, "total": 30, "low": 30, "high": 30},
+            {"cid": 20, "n": 2, "total": 5, "low": 5, "high": 5}
+          ]
+        }
+      },
+      {
+        "delete": ["orders[2]"],
+        "target_present": false,
+        "result": {
+          "columns": ["cid", "n", "total", "low", "high"],
+          "row_count": 2,
+          "rows": [
+            {"cid": 10, "n": 1, "total": 50, "low": 50, "high": 50},
+            {"cid": 20, "n": 2, "total": 5, "low": 5, "high": 5}
+          ]
+        }
+      }
+    ]
+  }
+}
 ```
+
+要点：
+
+* `cid=20` 组有一行 `amount=NULL`：`count(*)` 把它计入（见证含 `orders[4]`），
+  而 `count(amount)` 与 `sum/min/max` 会忽略 NULL（那种计划下见证只含
+  `orders[3]`）。
+* 当同值行可以互换时，析取项会被**完整保留**。例如组内 `30,30,50` 且仅做
+  `sum`，整体目标 110 的见证仍是三行合取；若极值并列（如两行都是 30 的
+  `min`），见证为 `(s1 ∧ s3) ∨ (s2 ∧ s3)`，两行同值组合各自独立出现，
+  再按符号/标签稳定排序去重。
 
 ### 幂等重放逐字节一致
 
@@ -261,7 +388,27 @@ cmp a.json b.json && echo "byte-identical"   # byte-identical
 * 来源行标签为 `表名[主键值,...]`，复合主键按顺序拼接。符号表把标签稳定映射为
   `s1, s2, ...`（按表名、主键全序排序）。
 * 见证集经过包含极小化：投影去列、自连接等造成的冗余派生会被剔除。
-* 选择、等值连接、投影以及 `count/sum/min/max` 分组聚合对源行集合都是单调的，
-  因此“令输出消失的最小删除集”恰好等于该输出全部极小见证的 **极小命中集**
-  （hypergraph transversal）。聚合输出按组键标识：删除后该组为空即视为消失；
-  每个删除场景都重算整条计划，并显式给出 `target_present`。
+* 选择、等值连接、投影对源行集合是单调的，其输出“令该行消失的最小删除集”
+  恰好等于该行全部极小见证的 **极小命中集**（hypergraph transversal）。
+* 分组聚合输出行的布尔溯源同时覆盖“组存在”与“每个聚合值”，各规则为：
+  * `count(*)`：见证是组内 **全部成员** 的合取；`count(column)`：把范围
+    收窄为该列 **非 NULL** 的全部行（忽略 NULL）。任何一个被计数行被删除
+    都会改变计数。
+  * `sum`：枚举组内非 NULL 数值中和等于目标值的 **极小组合**（相同数值
+    的不同行作为不同组合完整保留；零值行不进入极小见证），再要求组内
+    至少保留一个成员；最小删除集为任一非零值行（`sum` 含零值时零行删除
+    不影响结果，因此不在其中）。
+  * `min` / `max`：枚举能产生目标极值的极小组合——任一极值行即可产生该
+    极值（并列时给出多个析取项）；只有删除 **全部** 极值行才会改变极值
+    （NULL 一律忽略；全 NULL 时结果为 `null`）。
+  * 多个聚合并列时，见证按合取组合（一组行必须同时满足所有聚合）并做
+    包含极小化与稳定排序去重。
+* 因为 `sum` 在含零或正负混合取值时不是经典意义上的单调算子（删除某些行
+  后再删别的行，目标值可能因抵消而“恢复”），聚合输出行额外携带与重算
+  一致的 **精确最小删除集（killers）**；投影/连接会把它正确上提。对直接
+  扫描/过滤的分组，删除集由上述规则闭式给出；对连接等派生输入且涉及源行
+  不超过 12 行的组，服务通过枚举删除后子快照做精确校验，保证布尔溯源、
+  最小删除集与 `POST /query` 返回的删除后重算三者完全一致。
+* 聚合输出按组键标识：删除后该组为空（或该聚合输入整体为空，返回
+  `EMPTY_AGGREGATE`）即视为目标消失；每个删除场景都重算整条计划，并显式
+  给出 `target_present`。

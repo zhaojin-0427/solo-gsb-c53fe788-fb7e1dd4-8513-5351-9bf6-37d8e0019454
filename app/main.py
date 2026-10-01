@@ -10,15 +10,14 @@ from pydantic import BaseModel, Field, ConfigDict, ValidationError
 
 from . import canonical
 from .errors import ApiError
-from .evaluator import Evaluator, Label, Table
+from .evaluator import Evaluator, Label, Table, row_killers
 from .provenance import (
     build_symbol_table,
+    label_sort_key,
     label_to_string,
-    minimal_hitting_sets,
     present_row,
 )
 from .store import IdempotencyStore
-from .values import value_sort_key
 
 DB_PATH = os.environ.get("PROVENANCE_DB", "/data/provenance.db")
 
@@ -181,11 +180,16 @@ def execute_query(payload: QueryIn) -> dict[str, Any]:
     rows = ev.eval(payload.plan)
     columns = ev.schema(payload.plan)
 
-    # Global symbol table over every source row referenced by any witness.
+    # Global symbol table over every source row referenced by any witness
+    # or by any exact deletion set (aggregate killers may contain labels that
+    # are not in the why-witnesses, e.g. extremal ties / counted rows).
     all_labels: set[Label] = set()
     for r in rows:
         for w in r["witnesses"]:
             all_labels.update(w)
+        if r.get("killers") is not None:
+            for h in r["killers"]:
+                all_labels.update(h)
     symbols = build_symbol_table(all_labels)
 
     presented = [present_row(r, columns, symbols) for r in rows]
@@ -206,11 +210,18 @@ def execute_query(payload: QueryIn) -> dict[str, Any]:
         target_idx = resolve_target(payload.explain, presented, columns)
         target_raw = rows[target_idx]
         target_presented = presented[target_idx]
-        deletions = minimal_hitting_sets(target_raw["witnesses"])
+        # Exact minimal deletion sets: hitting sets of the witnesses for
+        # monotone rows, precomputed killers for aggregate rows. They always
+        # agree with full-plan recomputation below.
+        deletions_raw = row_killers(target_raw)
+        deletions = sorted(
+            deletions_raw,
+            key=lambda h: [label_sort_key(l) for l in sorted(h, key=label_sort_key)],
+        )
 
         scenarios = []
         for h in deletions:
-            deleted_sorted = sorted(h, key=lambda l: (l[0], tuple(value_sort_key(p) for p in l[1])))
+            deleted_sorted = sorted(h, key=label_sort_key)
             try:
                 rc, rrows = recompute_after_deletion(payload.plan, tables, h)
                 target_present = any(rr["data"] == target_raw["data"] for rr in rrows)
@@ -247,7 +258,7 @@ def execute_query(payload: QueryIn) -> dict[str, Any]:
             "target_provenance": target_presented["provenance"],
             "minimal_deletion_count": len(deletions),
             "minimal_deletion_sets": [
-                [label_to_string(l) for l in sorted(h, key=lambda l: (l[0], tuple(value_sort_key(p) for p in l[1])))]
+                [label_to_string(l) for l in sorted(h, key=label_sort_key)]
                 for h in deletions
             ],
             "scenarios": scenarios,

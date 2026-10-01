@@ -8,17 +8,19 @@ the DNF over all its minimal witnesses::
 
     (s1 ∧ s3) ∨ (s2 ∧ s3)
 
-Because witnesses are inclusion-minimal and the query is monotone
-(select / equi-join / project / count-sum-min-max over groups), the sets of
-source rows whose removal makes an output row disappear are exactly the
-minimal hitting sets of its minimal witnesses.
+For monotone operators (select / equi-join / project) the sets of source
+rows whose removal makes an output row disappear are exactly the minimal
+hitting sets of its minimal witnesses. Aggregate rows carry exact,
+precomputed minimal deletion sets ("killers") built by the evaluator,
+because exact-value aggregates such as ``sum`` are not monotone in the
+witness sense.
 """
 from __future__ import annotations
 
 from typing import Any
 
-from .evaluator import Label, Witness
-from .values import tuple_sort_key, value_sort_key
+from .evaluator import Label, minimal_hitting_sets  # re-exported
+from .values import value_sort_key
 
 
 # ---------------------------------------------------------------------------
@@ -80,41 +82,3 @@ def present_row(
             "labels_structured": [w["labels"] for w in witness_objs],
         },
     }
-
-
-# ---------------------------------------------------------------------------
-# Minimal hitting sets (minimal transversals)
-# ---------------------------------------------------------------------------
-
-def minimal_hitting_sets(witnesses: set[Witness]) -> list[frozenset[Label]]:
-    """All inclusion-minimal sets H with H ∩ W ≠ ∅ for every W."""
-    edges = [frozenset(w) for w in witnesses if w]
-    memo: dict[frozenset, set[frozenset[Label]]] = {}
-
-    def rec(edges: tuple[frozenset, ...]) -> set[frozenset[Label]]:
-        key = frozenset(edges)
-        if key in memo:
-            return memo[key]
-        if not edges:
-            return {frozenset()}
-
-        # Pick the smallest edge to branch on (keeps the recursion narrow).
-        e = min(edges, key=len)
-        results: set[frozenset[Label]] = set()
-        for v in e:
-            # Choosing v covers e and every edge containing v; the residual
-            # hypergraph is all remaining edges (intact) that v does not hit.
-            remaining = tuple(x for x in edges if v not in x)
-            for sub in rec(remaining):
-                results.add(frozenset(sub | {v}))
-        # Prune non-minimal solutions introduced on this branch.
-        minimal = {h for h in results if not any(o < h for o in results)}
-        memo[key] = minimal
-        return minimal
-
-    hitting = rec(tuple(edges))
-
-    def hit_key(h: frozenset[Label]):
-        return [label_sort_key(l) for l in sorted(h, key=label_sort_key)]
-
-    return sorted(hitting, key=hit_key)

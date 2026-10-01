@@ -257,12 +257,110 @@ def test_aggregate_counterfactual_group_deletion(client):
     r = client.post("/query", json=req)
     assert r.status_code == 200, r.text
     cf = r.json()["counterfactual"]
-    assert cf["target_provenance"]["dnf"] == "(s1) ∨ (s2)"
-    # Group survives on either member, so both rows must be deleted.
-    assert cf["minimal_deletion_sets"] == [["orders[1]", "orders[2]"]]
-    scenario = cf["scenarios"][0]
-    assert scenario["target_present"] is False
-    assert scenario["result"]["rows"] == [{"cid": 20, "total": 9}]
+    # sum=12 over 5 and 7: both rows form the single witness, but deleting
+    # either row alone changes the sum, so the minimal deletion sets are the
+    # two singletons.
+    assert cf["target_provenance"]["dnf"] == "(s1 ∧ s2)"
+    assert cf["minimal_deletion_sets"] == [["orders[1]"], ["orders[2]"]]
+    by_delete = {tuple(sc["delete"]): sc for sc in cf["scenarios"]}
+    s1 = by_delete[("orders[1]",)]
+    s2 = by_delete[("orders[2]",)]
+    assert s1["target_present"] is False and s2["target_present"] is False
+    # After deleting one order the group remains but with the other value.
+    assert s1["result"]["rows"] == [{"cid": 10, "total": 7}, {"cid": 20, "total": 9}]
+    assert s2["result"]["rows"] == [{"cid": 10, "total": 5}, {"cid": 20, "total": 9}]
+
+
+def test_aggregate_count_sum_witness_and_killers(client):
+    req = {
+        "idempotency_key": "key-agg-count-sum",
+        "tables": [
+            {
+                "table": "orders",
+                "primary_key": ["oid"],
+                "columns": ["oid", "cid", "amount"],
+                "rows": [
+                    {"oid": 1, "cid": 10, "amount": 50},
+                    {"oid": 2, "cid": 10, "amount": 30},
+                ],
+            }
+        ],
+        "plan": {
+            "type": "aggregate",
+            "input": {"type": "scan", "table": "orders"},
+            "group_by": ["cid"],
+            "aggregates": [
+                {"fn": "count", "column": "*", "as": "n"},
+                {"fn": "sum", "column": "amount", "as": "total"},
+            ],
+        },
+        "explain": {"row": {"cid": 10, "n": 2, "total": 80}},
+    }
+    r = client.post("/query", json=req)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    out = body["result"]["rows"][0]
+    assert out["row"] == {"cid": 10, "n": 2, "total": 80}
+    assert out["provenance"]["dnf"] == "(s1 ∧ s2)"
+    cf = body["counterfactual"]
+    assert cf["minimal_deletion_sets"] == [["orders[1]"], ["orders[2]"]]
+    for sc in cf["scenarios"]:
+        assert sc["target_present"] is False
+        # Recomputation leaves the group with count=1 and the other amount.
+        deleted = sc["delete"][0]
+        remaining = 30 if deleted == "orders[1]" else 50
+        assert sc["result"]["rows"] == [{"cid": 10, "n": 1, "total": remaining}]
+
+
+def test_aggregate_min_max_tie_and_null(client):
+    req = {
+        "idempotency_key": "key-agg-tie-null",
+        "tables": [
+            {
+                "table": "orders",
+                "primary_key": ["oid"],
+                "columns": ["oid", "cid", "amount"],
+                "rows": [
+                    {"oid": 1, "cid": 10, "amount": 30},
+                    {"oid": 2, "cid": 10, "amount": 30},
+                    {"oid": 3, "cid": 10, "amount": 50},
+                    {"oid": 4, "cid": 10, "amount": None},
+                ],
+            }
+        ],
+        "plan": {
+            "type": "aggregate",
+            "input": {"type": "scan", "table": "orders"},
+            "group_by": ["cid"],
+            "aggregates": [
+                {"fn": "count", "column": "amount", "as": "n"},
+                {"fn": "min", "column": "amount", "as": "lo"},
+                {"fn": "max", "column": "amount", "as": "hi"},
+            ],
+        },
+        "explain": {"index": 0},
+    }
+    r = client.post("/query", json=req)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    out = body["result"]["rows"][0]
+    assert out["row"] == {"cid": 10, "n": 3, "lo": 30, "hi": 50}
+    # count(amount)=3 forces all three non-NULL rows into the witness;
+    # the NULL row never participates.
+    assert out["provenance"]["labels_structured"] == [
+        ["orders[1]", "orders[2]", "orders[3]"],
+    ]
+    cf = body["counterfactual"]
+    deletions = {tuple(d) for d in cf["minimal_deletion_sets"]}
+    # count(column)=3 changes on deleting any single counted row; those
+    # singletons dominate the "delete both min ties" alternative.
+    assert deletions == {
+        ("orders[1]",),
+        ("orders[2]",),
+        ("orders[3]",),
+    }
+    for sc in cf["scenarios"]:
+        assert sc["target_present"] is False
 
 
 def test_counterfactual_recompute_empty_aggregate(client):
